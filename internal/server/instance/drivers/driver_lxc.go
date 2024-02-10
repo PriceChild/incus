@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -795,7 +796,6 @@ func (d *lxc) initLXC(config bool) (*liblxc.Container, error) {
 	bindMounts := []string{
 		"/dev/fuse",
 		"/dev/net/tun",
-		"/proc/sys/fs/binfmt_misc",
 		"/sys/firmware/efi/efivars",
 		"/sys/fs/fuse/connections",
 		"/sys/fs/pstore",
@@ -803,6 +803,11 @@ func (d *lxc) initLXC(config bool) (*liblxc.Container, error) {
 		"/sys/kernel/debug",
 		"/sys/kernel/security",
 		"/sys/kernel/tracing",
+	}
+
+	// Handle unprivileged binfmt_misc.
+	if d.IsPrivileged() || !d.state.OS.UnprivBinfmt {
+		bindMounts = append(bindMounts, "/proc/sys/fs/binfmt_misc")
 	}
 
 	// Pass in /dev/zfs to the container if delegation is supported on the system.
@@ -6623,6 +6628,47 @@ func (d *lxc) templateApplyNow(trigger instance.TemplateTrigger) error {
 					return fmt.Errorf("Failed to create template file: %w", err)
 				}
 			} else {
+				// UID and GID
+				fileUID := int64(0)
+				fileGID := int64(0)
+
+				if tpl.UID != "" {
+					id, err := strconv.ParseInt(tpl.UID, 10, 64)
+					if err != nil {
+						return fmt.Errorf("Bad file UID %q for %q: %w", tpl.UID, tplPath, err)
+					}
+
+					fileUID = id
+				}
+
+				if tpl.GID != "" {
+					id, err := strconv.ParseInt(tpl.GID, 10, 64)
+					if err != nil {
+						return fmt.Errorf("Bad file GID %q for %q: %w", tpl.GID, tplPath, err)
+					}
+
+					fileGID = id
+				}
+
+				if idmapset != nil {
+					fileUID, fileGID = idmapset.ShiftIntoNS(fileUID, fileGID)
+				}
+
+				// Mode
+				fileMode := fs.FileMode(0644)
+				if tpl.Mode != "" {
+					if len(tpl.Mode) == 3 {
+						tpl.Mode = fmt.Sprintf("0%s", tpl.Mode)
+					}
+
+					mode, err := strconv.ParseInt(tpl.Mode, 0, 0)
+					if err != nil {
+						return fmt.Errorf("Bad mode %q for %q: %w", tpl.Mode, tplPath, err)
+					}
+
+					fileMode = os.FileMode(mode) & os.ModePerm
+				}
+
 				// Create the directories leading to the file
 				err = internalUtil.MkdirAllOwner(path.Dir(fullpath), 0755, int(rootUID), int(rootGID))
 				if err != nil {
@@ -6636,12 +6682,12 @@ func (d *lxc) templateApplyNow(trigger instance.TemplateTrigger) error {
 				}
 
 				// Fix ownership and mode
-				err = w.Chown(int(rootUID), int(rootGID))
+				err = w.Chown(int(fileUID), int(fileGID))
 				if err != nil {
 					return err
 				}
 
-				err = w.Chmod(0644)
+				err = w.Chmod(fileMode)
 				if err != nil {
 					return err
 				}
